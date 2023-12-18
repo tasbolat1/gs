@@ -24,7 +24,6 @@ RESIZED_FOR_OF = True # set true for optical flow
 # HEIGHT = 3280
 # RESIZED_FOR_OF = False # set true for optical flow
 
-
 cvbridge = CvBridge()
 
 def search_for_devices(total_ids = 10):
@@ -59,9 +58,6 @@ def resize_crop_mini(img, imgw, imgh):
     # final resize for 3d
     img = cv2.resize(img, (imgw, imgh))
     return img
-
-
-
 
 class WebcamVideoStream :
     '''
@@ -201,8 +197,6 @@ class OpticalFlowDetector:
             self.Oy = Oy
             self.initialized = True
 
-
-
     def update(self, img):
 
         if not self.initialized:
@@ -226,7 +220,6 @@ class OpticalFlowDetector:
         
         self.pre_grey_img = self.curr_grey_img.copy()
 
-
         # Draw the tracks
         flow_lines = {
             'start': [],
@@ -242,6 +235,28 @@ class OpticalFlowDetector:
             flow_lines['end'].append((int(a),int(b)))
 
         return flow_lines
+
+
+def calc_force(flow_lines, mag_eps=1.0):
+    
+    # build the matrix for initial
+    init_xy = np.array(flow_lines['start'])
+    curr_xy = np.array(flow_lines['end'])
+
+    accepted_mag = []
+    accepted_ang = []
+    for i in range(flow_lines['size']):
+        mag =  init_xy[i] - curr_xy[i]
+
+        accepted_mag.append(mag)
+        accepted_ang.append(np.arctan2(init_xy[i], curr_xy[i]))
+
+    force_mag = np.array(accepted_mag).sum(axis=0)
+    force_angle = np.arctan2(force_mag[0], force_mag[1])
+    force_mag = np.sqrt( (force_mag**2).sum() )
+
+    return force_mag, force_angle*180/np.pi
+
 
 
 if __name__ == '__main__':
@@ -283,6 +298,11 @@ if __name__ == '__main__':
 
                 # calculate optical flow - MUST be fast!
                 flow_lines = gs.OF.update(gs.img)
+
+                # calc force
+                force_mag, force_angle = calc_force(flow_lines)
+                print(force_mag)
+                print(force_angle)
                 
                 for i in range(flow_lines['size']):
                     offrame = cv2.arrowedLine(gs.img, flow_lines['start'][i], flow_lines['end'][i], (255,255,255), thickness=1, line_type=cv2.LINE_8, tipLength=.15)
@@ -294,14 +314,10 @@ if __name__ == '__main__':
             else:
                 cv2.imshow('gsmini{}'.format(gs.src), gs.img)
 
-            
-
         if cv2.waitKey(1) == 27 :
             break
 
-
         r.sleep()
-
 
     # close all windows
     for gs in gss:
