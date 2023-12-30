@@ -13,19 +13,6 @@ from scipy.signal import fftconvolve
 
 
 def normxcorr2(template, image, mode="full"):
-    """
-    Input arrays should be floating point numbers.
-    :param template: N-D array, of template or filter you are using for cross-correlation.
-    Must be less or equal dimensions to image.
-    Length of each dimension must be less than length of image.
-    :param image: N-D array
-    :param mode: Options, "full", "valid", "same"
-    full (Default): The output of fftconvolve is the full discrete linear convolution of the inputs.
-    Output size will be image size + 1/2 template size in each dimension.
-    valid: The output consists only of those elements that do not rely on the zero-padding.
-    same: The output is the same size as image, centered with respect to the ‘full’ output.
-    :return: N-D array of same dimensions as image. Size depends on mode parameter.
-    """
 
     # If this happens, it is probably a mistake
     if np.ndim(template) > np.ndim(image) or \

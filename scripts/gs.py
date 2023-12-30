@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 
 import cv2
 import numpy as np
@@ -7,6 +7,9 @@ import rospy
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 from markertracker import MarkerTracker
+from std_msgs.msg import Float64MultiArray, Float64, String
+import scipy.signal
+from live_filters import LiveLFilter, LiveSosFilter
 
 CAMERA_CAPTURE_FREQUENCY = 25 # tested, do not increase!
 
@@ -16,6 +19,12 @@ COMPUTE_OF = True # compute optical flow
 WIDTH = 240
 HEIGHT = 320
 RESIZED_FOR_OF = True # set true for optical flow
+
+# # OPTICAL FLOW CONFIG
+# COMPUTE_OF = False # compute optical flow
+# WIDTH = 240
+# HEIGHT = 320
+# RESIZED_FOR_OF = True # set true for optical flow
 
 
 # # HIGH QUALITY IMAGE CONFIG
@@ -40,6 +49,7 @@ def search_for_devices(total_ids = 10):
             ret, _ = cap.read()
             if ret:
                 found_ids.append(_id)
+                print(cap.getBackendName())
                 cap.release()
             else:
                 break
@@ -88,16 +98,23 @@ class WebcamVideoStream :
 
     def update(self) :
         while self.started :
-            (grabbed, frame) = self.stream.read()
-            self.read_lock.acquire()
-            self.grabbed, self.frame = grabbed, frame
+            try:
+                (grabbed, frame) = self.stream.read()
+                self.read_lock.acquire()
+                self.grabbed, self.frame = grabbed, frame
 
-            if self.frame is None:
+                if self.frame is None:
+                    self.connection_lost = True
+                    print("lost connection with camera, src={}".format(self.src))
+                    print("Shutting down")
+                    rospy.signal_shutdown("Connection Lost")
+                self.read_lock.release()
+
+            except:
                 self.connection_lost = True
-                print("lost connection with camera, src={}".format(self.src))
+                print("Smth happened with camera, src={}".format(self.src))
                 print("Shutting down")
-                exit()
-            self.read_lock.release()
+                rospy.signal_shutdown("Smth bad happened")
 
     def read(self) :
         self.read_lock.acquire()
@@ -119,28 +136,48 @@ class GS:
         self.vs = WebcamVideoStream(src=src).start()
         self.width = width
         self.height = height
-
         self.img = None
+        self.pre_img = None
+        self.saved_img=None
+
+        # Optical filter holder
         self.OF = None
         self.resized_for_OF = resized_for_OF
+        
+        # Force estimate holder
+        self.FE = None
 
         # flash out black pixels at the beginning
-        self.flash_out_size=20
+        self.flash_out_size=50
         self.initialize()
 
+        
+    def save_image_instance(self):
+        print('saving ...')
+        self.saved_img = self.img.copy()
 
     def initialize(self):
         for i in range(self.flash_out_size):
             self.vs.read()
 
     def capture(self):
+
         img = self.vs.read()
+
+        # if self.pre_img is None:
+        #     if self.resized_for_OF:
+        #         self.pre_img = resize_crop_mini(img,self.height,self.width)
+        #     else:
+        #         self.pre_img = cv2.resize(img, (self.width, self.height))
+        # else:
+        #     self.pre_img = self.img.copy()
+
         if self.resized_for_OF:
             self.img = resize_crop_mini(img,self.height,self.width)
         else:
             self.img = cv2.resize(img, (self.width, self.height))
-        
 
+        
 
     def publish(self):
         img_msg = cvbridge.cv2_to_imgmsg(self.img, encoding="passthrough")
@@ -181,8 +218,6 @@ class OpticalFlowDetector:
             nct = len(marker_centers)
             print("Initial markers are detected")
 
-            
-
             # Existing p0 array
             p0 = np.array([[Ox[0], Oy[0]]], np.float32).reshape(-1, 1, 2)
             for i in range(nct - 1):
@@ -213,7 +248,7 @@ class OpticalFlowDetector:
 
         if len(good_new) < self.nct:
             # Detect new features in the current frame
-            print(f"all pts did not converge")
+            print("all pts did not converge")
         else:
             # Update points for next iteration
             self.p0 = good_new.reshape(-1, 1, 2)
@@ -235,35 +270,123 @@ class OpticalFlowDetector:
             flow_lines['end'].append((int(a),int(b)))
 
         return flow_lines
-
-
-def calc_force(flow_lines, mag_eps=1.0):
     
-    # build the matrix for initial
-    init_xy = np.array(flow_lines['start'])
-    curr_xy = np.array(flow_lines['end'])
-
-    accepted_mag = []
-    accepted_ang = []
-    for i in range(flow_lines['size']):
-        mag =  init_xy[i] - curr_xy[i]
-
-        accepted_mag.append(mag)
-        accepted_ang.append(np.arctan2(init_xy[i], curr_xy[i]))
-
-    force_mag = np.array(accepted_mag).sum(axis=0)
-    force_angle = np.arctan2(force_mag[0], force_mag[1])
-    force_mag = np.sqrt( (force_mag**2).sum() )
-
-    return force_mag, force_angle*180/np.pi
 
 
+class ForceEstimatorSimple:
+    def __init__(self, id, filter_type='sos', reversed = False):
+        self.id = id
+
+        self.pub = rospy.Publisher("/gsmini_{}_EF".format(self.id), Float64MultiArray, queue_size=1)
+        self.array = Float64MultiArray()
+        
+        rospy.Subscriber("/gsmini_{}_EF_init".format(self.id), String, queue_size=1, callback=self.initCallback)
+
+
+        assert filter_type in [None, 'sos', 'lfilter']
+        if filter_type == 'lfilter':
+            b, a = scipy.signal.iirfilter(4, Wn=2.5, fs=CAMERA_CAPTURE_FREQUENCY, btype="low", ftype="butter")
+            self.live_lfilter = LiveLFilter(b, a)
+
+        elif filter_type == 'sos':
+            sos = scipy.signal.iirfilter(4, Wn=2.5, fs=CAMERA_CAPTURE_FREQUENCY, btype="low",
+                                ftype="butter", output="sos")
+            self.live_lfilter = LiveSosFilter(sos)
+
+        elif filter_type is None:
+            self.live_lfilter = self._repeat
+
+        self.reversed = reversed
+        self.init_xy = None
+
+    def initCallback(self, msg):
+        self.init_xy = None
+
+    def _repeat(self, x):
+        return x
+    
+    # def set_start_lines(self, start_lines):
+    #     self.init_xy = start_lines
+        
+    def calc_force(self, flow_lines):
+    
+        # build the matrix for initial
+        # self.init_xy = np.array(flow_lines['start'])
+
+        if self.init_xy is None:
+            self.init_xy = np.array(flow_lines['end'])
+            self.reinit = False
+        curr_xy = np.array(flow_lines['end'])
+
+        accepted_mag = []
+        accepted_ang = []
+
+        for i in range(flow_lines['size']):
+            mag =  self.init_xy[i] - curr_xy[i]
+
+            accepted_mag.append(mag)
+            accepted_ang.append(np.arctan2(self.init_xy[i], curr_xy[i]))
+
+        forces = np.array(accepted_mag).sum(axis=0)
+        force_mag = np.sqrt( (forces**2).sum() )
+
+        force_angle = np.arctan2(forces[0], forces[1])
+        force_angle = force_angle*180/np.pi
+
+        # filter the magnitude
+        if self.reversed:
+            force_mag = -1 * force_mag
+            
+        force_mag = self.live_lfilter(force_mag)
+
+        self.array.data = [force_mag, force_angle]
+        self.pub.publish(self.array)
+
+
+        return force_mag, force_angle
+    
+
+    def avg_z_curl(flow_line):
+        Ox = flow_lines['start']
+        Oy = flow_lines['start']
+        Ox, Oy, Cx, Cy, Occupied = flow_lines['end']
+        xlen = len(Ox)
+        ylen = len(Ox[0])
+        v_grad_x = np.true_divide(np.gradient(Cy, axis=1), np.gradient(Ox, axis=1))
+        u_grad_y = np.true_divide(np.gradient(Cx, axis=0), np.gradient(Oy, axis=0))
+        curl_z = np.add(v_grad_x, u_grad_y)
+        return sum(sum(curl_z))/(xlen*ylen)
+
+class CombinedForceSimple:
+    def __init__(self):
+        self.pub = rospy.Publisher("/gsmini_combined_EF", Float64, queue_size=1)
+
+        self.x1 = None
+        self.x2 = None
+
+    def publish(self):
+        if self.x1 is None:
+            self.pub.publish( self.x2 )
+        elif self.x2 is None:
+            self.pub.publish( self.x1 ) 
+        else:
+            self.pub.publish( (self.x1 + self.x2)/2 )
 
 if __name__ == '__main__':
 
+
     rospy.init_node('GS', anonymous=True)
 
+    # READ!!!!
+    # GelSight Mini R0B 28ZD-WLWJ: 3
+    # GelSight Mini R0B 2G0K-977Z: 4
+
+    # Make sure that GelSight Mini R0B 28ZD-WLWJ: is ID 0
+    # Make sure that GelSight Mini R0B 2G0K-977Z: is ID 2
+
     gs_ids = search_for_devices()
+
+    print(gs_ids)
 
     r = rospy.Rate(CAMERA_CAPTURE_FREQUENCY)
     NUM_SENSORS = len(gs_ids)
@@ -275,18 +398,30 @@ if __name__ == '__main__':
     # run sensors
     gss = []
     for src in gs_ids:
-        gss.append(GS(src, width=WIDTH, height=HEIGHT))
+        gs = GS(src, width=WIDTH, height=HEIGHT)
+        # gs.capture()
+        # gs.save_image_instance()
+        gss.append(gs)
 
-    
+
     # intialize the optical flow
     if COMPUTE_OF:
         print('Initializing Optical Flow ... ')
         for gs in gss:
+            # optical flow
             of = OpticalFlowDetector(id=gs.src)
             gs.capture()
             of.init(gs.img)
             gs.OF = of
+            
+            # set force estimator
+            FE = ForceEstimatorSimple(id=gs.src, filter_type='sos', reversed=False)
+            gs.FE = FE
+
         print('Done.')
+
+
+    ForcePub = CombinedForceSimple()
 
     # run infinity loop
     while not rospy.is_shutdown():
@@ -299,20 +434,43 @@ if __name__ == '__main__':
                 # calculate optical flow - MUST be fast!
                 flow_lines = gs.OF.update(gs.img)
 
+
                 # calc force
-                force_mag, force_angle = calc_force(flow_lines)
-                print(force_mag)
-                print(force_angle)
+                force_mag, force_angle = gs.FE.calc_force(flow_lines)
+
+                # if gs.src == 0:
+                #     print("Force: {}, Angle: {}".format(force_mag, force_angle))
+
+                if gs.src == 0:
+                    ForcePub.x2 = force_mag
+                else:
+                    ForcePub.x1 = force_mag
+                # force_mag = gs.live_lfilter(force_mag)
+                # print('Publishing', gs.src)
                 
+
+                # print('GS {}: {}, {}'.format(gs.src, force_mag, force_angle))
                 for i in range(flow_lines['size']):
                     offrame = cv2.arrowedLine(gs.img, flow_lines['start'][i], flow_lines['end'][i], (255,255,255), thickness=1, line_type=cv2.LINE_8, tipLength=.15)
                     # offrame = cv2.circle(offrame, flow_lines['end'][i], 5, color[i].tolist(), -1)
 
                 cv2.imshow('gsmini{}_OF'.format(gs.src), offrame)
-                #cv2.imshow('gsmini{}_OF'.format(gs.src), gs.OF.curr_grey_img)
+                # cv2.imshow('gsmini{}_OF'.format(gs.src), gs.OF.curr_grey_img)
 
             else:
+                pass
                 cv2.imshow('gsmini{}'.format(gs.src), gs.img)
+                
+                # test new thing
+                # new_img = cv2.Laplacian(gs.img,cv2.CV_64F)
+                
+                # a = np.gradient(gs.img)
+                # print(a[0].shape)
+                # print(gs.img.shape, gs.pre_img.shape, gs.saved_img.shape)
+                # a = cv2.subtract(gs.img, gs.saved_img)
+                # cv2.imshow('gsmini{}'.format(gs.src), a)
+
+        ForcePub.publish()
 
         if cv2.waitKey(1) == 27 :
             break

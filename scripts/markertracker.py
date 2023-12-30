@@ -118,7 +118,7 @@ class MarkerTracker:
             row_coordinates = (np.round(gridct[:, 1])).astype('int')
             col_coordinates = (np.round(gridct[:, 0])).astype('int')
 
-        print(f"Number of rows, cols: {num_rows}, {num_cols}")
+        print("Number of rows, cols: {}, {}".format(num_rows, num_cols))
         #print("Row coordinates:", row_coordinates)
         #print("Column coordinates:", col_coordinates)
 
@@ -169,8 +169,8 @@ class MarkerTracker:
         # Check size against marker model
         sc = 1
         if ydim != self.ydim or xdim != self.xdim:
-            print(f"image size {xdim} x {ydim} differs from model size {self.xdim} x {self.ydim}")
-            print(f"Resize the model or images so they match.\n")
+            print("image size {} x {} differs from model size {} x {}".format(xdim, ydim, self.xdim, self.ydim))
+            print("Resize the model or images so they match.\n")
             exit(-1)
             sc = np.mean([xdim/self.xdim, ydim/self.ydim])
 
